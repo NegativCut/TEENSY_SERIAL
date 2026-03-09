@@ -123,6 +123,13 @@ Core 1: USBHost.task() + serialized TX/RX scheduling
 - `USBHost.task(10)` — added 10ms timeout parameter
 - Both changes aimed at reducing pio_usb instability under sustained transfers
 
+## 2026-03-10 — Session 6
+- Main sketch confirmed working end-to-end on Teensy 4.0 hardware
+- USB host, FT232R, RS232, SCPI, TFT scroll, encoder profile select all working
+- Fixes applied: menu title truncated to 21 chars; encoder detent logic corrected (divide by 4 before compare)
+- USB connection status indicator: 2px green/red bar on right edge of TFT
+- GDM-8251A live readings confirmed on display
+
 ## 2026-03-09 — Session 5 (Teensy port)
 - Project moved to `G:\09 DROPBOX\CODE\GIT_REPOS\TEENSY_USB_TFT_ENC_SERIAL`
 - New sketch: Teensy 4.0, USBHost_t36 (native USB), single core, profile system with EEPROM persistence

@@ -4,7 +4,7 @@
 
 | # | Issue | Status |
 |---|-------|--------|
-| 1 | First flash — untested | Pending |
+| 1 | ~~First flash — untested~~ | **Resolved** — all hardware confirmed working |
 
 ---
 

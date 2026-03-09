@@ -64,6 +64,13 @@ char    rx_line[256];
 uint16_t rx_line_pos    = 0;
 
 // ── TFT helpers ───────────────────────────────────────────────────
+
+// 2×8 status indicator at top-right (pixels 126-127, clear of 21-char text)
+static void tft_status(bool connected) {
+  uint16_t colour = connected ? TFT_GREEN : TFT_RED;
+  tft.fillRect(126, 0, 2, 160, colour);
+}
+
 static void tft_scroll_add(const char* line) {
   snprintf(scr_lines[scr_write], LINE_W, "%-21s", line);
   scr_write = (scr_write + 1) % SCROLL_LINES;
@@ -108,7 +115,7 @@ static void tft_drawMenu() {
   tft.setTextSize(1);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(0, 0);
-  tft.print("=== SELECT PROFILE ===");
+  tft.print("=== SELECT PROFILE ==");
 
   for (int i = 0; i < numProfiles; i++) {
     tft.setCursor(0, (i + 2) * LINE_H);
@@ -166,6 +173,7 @@ void setup() {
   selectedProfile = EEPROM.read(0);
   if (selectedProfile >= numProfiles) selectedProfile = 0;
 
+  tft_status(false);
   tft_log("Teensy 4.0 multi-profile ready");
   tft_log("USB-A socket soldered to bottom D+/D- pads");
   tft_logf("Last profile: %s", profiles[selectedProfile].name);
@@ -200,27 +208,28 @@ void loop() {
     }
   }
 
-  // Encoder (menu only)
-  static long oldPosition = myEnc.read();
-  long newPos = myEnc.read();
-  if (inMenu && newPos != oldPosition) {
-    int delta = (newPos - oldPosition) / 4;
-    menuSelection += delta;
+  // Encoder (menu only) — divide by 4 first to work in detents
+  static long oldDetent = myEnc.read() / 4;
+  long newDetent = myEnc.read() / 4;
+  if (inMenu && newDetent != oldDetent) {
+    menuSelection += (int)(newDetent - oldDetent);
     if (menuSelection < 0) menuSelection = 0;
     if (menuSelection >= numProfiles) menuSelection = numProfiles - 1;
     tft_drawMenu();
-    oldPosition = newPos;
+    oldDetent = newDetent;
   }
 
   // Connect / disconnect
   if (userial && !meter_ready) {
     meter_ready = true;
     userial.begin(profiles[selectedProfile].baud);
+    tft_status(true);
     tft_log("FT232R connected");
     applyProfile(selectedProfile);
   }
   if (!userial && meter_ready) {
     meter_ready = false;
+    tft_status(false);
     tft_log("--- disconnected ---");
   }
 
