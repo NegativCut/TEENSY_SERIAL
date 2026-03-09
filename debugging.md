@@ -22,6 +22,16 @@ Tracks what has been tried and the outcome. Do not re-try failed approaches.
 
 ---
 
+## TFT Display
+
+### Top row of pixels cut off
+- BLACKTAB at rotation 0 sets no rowstart (stays 0) — one pixel row clipped at top
+- `TFT_ROWSTART` in User_Setup.h has no effect — not used anywhere in the library
+- **Fix:** Added `rowstart = 1` to BLACKTAB case 0 in `TFT_Drivers/ST7735_Rotation.h`
+- Confirmed working
+
+---
+
 ## Build — Teensy 4.0
 
 ### setup_t name collision (TFT_eSPI vs USBHost_t36)

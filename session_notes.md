@@ -129,7 +129,9 @@ Core 1: USBHost.task() + serialized TX/RX scheduling
 - arduino-cli installed to `C:\Users\Dell\AppData\Local\arduino-cli\`; Teensy core 1.60.0
 - `setup_t` name collision fixed: renamed to `tft_setup_t` in TFT_eSPI.h and TFT_eSPI.cpp
 - TFT_eSPI User_Setup.h updated for Teensy 4.0 pins; Pico backup saved as `User_Setup_pico_usb_tft_enc.h`
-- First build: clean compile — FLASH 67KB/2MB, RAM1 81KB used — standing by for hardware test
+- First build: clean compile — FLASH 67KB/2MB, RAM1 81KB used
+- TFT test confirmed working on Teensy 4.0 hardware
+- Top row pixel fix: `rowstart=1` added to BLACKTAB case 0 in `ST7735_Rotation.h` (TFT_ROWSTART in User_Setup.h is ineffective — not used by library)
 
 ## 2026-03-09 — Session 3
 - TFT_eSPI with hardware SPI0 at 27MHz confirmed working — replaces Adafruit slow software SPI
