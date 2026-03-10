@@ -1,8 +1,9 @@
 /*
- * teensy_usb_tft_enc_profiles.ino
+ * TEENSY_TFT_ENC_SERIAL.ino
  *
- * Teensy 4.0 — Multi-profile USB serial instrument display
- * Native USB Host (direct solder to bottom D+/D- pads) → FT232R
+ * Teensy 4.0 — Multi-profile USB serial instrument display + flash drive logging
+ * Native USB Host (direct solder to bottom D+/D- pads)
+ * USB-A: FT232R (serial mode) OR flash drive (storage mode) — not simultaneous
  *
  *  TFT    | Teensy Pin     Encoder | Teensy Pin     USB-A socket (direct solder)
  *  -------|-----------     --------|-----------     ---------------------------
@@ -12,6 +13,8 @@
  *  DC     | 9                                   GND     | any GND pad
  *  CS     | 10
  *  BLK    | 7
+ *
+ * EEPROM: byte 0 = selectedProfile, byte 1 = log file counter
  */
 
 #include <TFT_eSPI.h>      // ← MUST be before USBHost_t36
@@ -26,9 +29,10 @@
 #define ENC_B     4
 
 // ── TFT layout ────────────────────────────────────────────────────
-#define SCROLL_LINES  20
+#define SCROLL_LINES  19
 #define LINE_H        8
 #define LINE_W        22
+#define SCROLL_Y      LINE_H   // top line reserved for status bar
 
 // ── Profile definition (add new instruments here) ─────────────────
 struct Profile {
@@ -47,28 +51,84 @@ const Profile profiles[] = {
 const int numProfiles = sizeof(profiles) / sizeof(Profile);
 
 // ── Display & state ───────────────────────────────────────────────
-static char    scr_lines[SCROLL_LINES][LINE_W];
-static uint8_t scr_write = 0;
-static uint8_t scr_count = 0;
+static char     scr_lines[SCROLL_LINES][LINE_W];
+static uint8_t  scr_write = 0;
+static uint8_t  scr_count = 0;
+static uint32_t rx_count  = 0;
 
-TFT_eSPI    tft;
-USBHost     myusb;
-USBSerial   userial(myusb);
-Encoder     myEnc(ENC_A, ENC_B);
+TFT_eSPI       tft;
+USBHost        myusb;
+USBSerial      userial(myusb);
+USBDrive       myDrive(myusb);
+USBFilesystem  myFS(myusb);
+Encoder        myEnc(ENC_A, ENC_B);
 
-int     selectedProfile = 0;
-bool    meter_ready     = false;
-bool    inMenu          = false;
-int     menuSelection   = 0;
-char    rx_line[256];
-uint16_t rx_line_pos    = 0;
+int      selectedProfile = 0;
+bool     meter_ready     = false;
+bool     storage_ready   = false;
+bool     logging_active  = false;
+uint8_t  log_file_num    = 0;
+File     log_file;
+bool     inMenu          = false;
+int      menuSelection   = 0;
+char     rx_line[256];
+uint16_t rx_line_pos     = 0;
 
 // ── TFT helpers ───────────────────────────────────────────────────
 
-// 2×8 status indicator at top-right (pixels 126-127, clear of 21-char text)
-static void tft_status(bool connected) {
-  uint16_t colour = connected ? TFT_GREEN : TFT_RED;
-  tft.fillRect(126, 0, 2, 160, colour);
+// Status bar — top 8px row, mode-aware
+static void tft_draw_status() {
+  tft.fillRect(0, 0, 128, LINE_H, TFT_BLACK);
+  tft.setTextSize(1);
+  if (storage_ready) {
+    if (logging_active) {
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.setCursor(0, 0);
+      tft.printf("LOG:ON  log%02d.csv", log_file_num);
+    } else {
+      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+      tft.setCursor(0, 0);
+      tft.print("LOG:OFF [btn=start]");
+    }
+    tft.fillRect(124, 1, 4, 6, TFT_GREEN);
+  } else {
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.setCursor(0, 0);
+    tft.printf("RX:%lu", rx_count);
+    uint16_t dot = meter_ready ? TFT_GREEN : TFT_RED;
+    tft.fillRect(124, 1, 4, 6, dot);
+  }
+}
+
+// ── Log file helpers ──────────────────────────────────────────────
+static void log_open() {
+  log_file_num++;
+  if (log_file_num > 99) log_file_num = 1;
+  EEPROM.write(1, log_file_num);
+  char fname[16];
+  snprintf(fname, sizeof(fname), "log%02d.csv", log_file_num);
+  log_file = myFS.open(fname, FILE_WRITE);
+  if (log_file) {
+    log_file.println("rx_count,value");
+    logging_active = true;
+    tft_draw_status();
+    tft_logf("logging: log%02d.csv", log_file_num);
+  } else {
+    tft_log("FAIL: log file open");
+  }
+}
+
+static void log_close() {
+  if (log_file) log_file.close();
+  logging_active = false;
+  tft_draw_status();
+  tft_logf("log%02d.csv closed", log_file_num);
+}
+
+static void log_write(const char* value) {
+  if (logging_active && log_file) {
+    log_file.printf("%lu,%s\n", rx_count, value);
+  }
 }
 
 static void tft_scroll_add(const char* line) {
@@ -80,9 +140,10 @@ static void tft_scroll_add(const char* line) {
   tft.setTextSize(1);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   for (uint8_t i = 0; i < scr_count; i++) {
-    tft.setCursor(0, i * LINE_H);
+    tft.setCursor(0, SCROLL_Y + i * LINE_H);
     tft.print(scr_lines[(head + i) % SCROLL_LINES]);
   }
+  tft_draw_status();
 }
 
 static void tft_log(const char* line) {
@@ -105,9 +166,10 @@ static void redrawScroll() {
   tft.setTextSize(1);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   for (uint8_t i = 0; i < scr_count; i++) {
-    tft.setCursor(0, i * LINE_H);
+    tft.setCursor(0, SCROLL_Y + i * LINE_H);
     tft.print(scr_lines[(head + i) % SCROLL_LINES]);
   }
+  tft_draw_status();
 }
 
 static void tft_drawMenu() {
@@ -172,8 +234,10 @@ void setup() {
 
   selectedProfile = EEPROM.read(0);
   if (selectedProfile >= numProfiles) selectedProfile = 0;
+  log_file_num = EEPROM.read(1);
+  if (log_file_num > 99) log_file_num = 0;
 
-  tft_status(false);
+  tft_draw_status();
   tft_log("Teensy 4.0 multi-profile ready");
   tft_log("USB-A socket soldered to bottom D+/D- pads");
   tft_logf("Last profile: %s", profiles[selectedProfile].name);
@@ -197,7 +261,11 @@ void loop() {
   static uint32_t btn_last = 0;
   if (digitalRead(ENC_SW) == LOW && millis() - btn_last > 250) {
     btn_last = millis();
-    if (inMenu) {
+    if (storage_ready) {
+      // Storage mode: toggle logging
+      if (logging_active) log_close();
+      else                log_open();
+    } else if (inMenu) {
       applyProfile(menuSelection);
       inMenu = false;
       redrawScroll();
@@ -223,14 +291,28 @@ void loop() {
   if (userial && !meter_ready) {
     meter_ready = true;
     userial.begin(profiles[selectedProfile].baud);
-    tft_status(true);
+    tft_draw_status();
     tft_log("FT232R connected");
     applyProfile(selectedProfile);
   }
   if (!userial && meter_ready) {
     meter_ready = false;
-    tft_status(false);
+    tft_draw_status();
     tft_log("--- disconnected ---");
+  }
+
+  // Storage connect / disconnect
+  if (myFS && !storage_ready) {
+    storage_ready = true;
+    tft_draw_status();
+    tft_log("storage ready");
+    tft_log("btn to start logging");
+  }
+  if (!myFS && storage_ready) {
+    if (logging_active) log_close();
+    storage_ready = false;
+    tft_draw_status();
+    tft_log("storage removed");
   }
 
   // Serial monitor passthrough
@@ -259,13 +341,15 @@ void loop() {
       if (c == '\n' || c == '\r') {
         if (rx_line_pos > 0) {
           rx_line[rx_line_pos] = '\0';
+          rx_count++;
+          log_write(rx_line);
           if (!inMenu) {
             char buf[LINE_W];
             snprintf(buf, LINE_W, "[RX] %-16s", rx_line);
             tft_log(buf);
           }
           if (profiles[selectedProfile].poll_cmd != nullptr) {
-            sendScpi(profiles[selectedProfile].poll_cmd, false);
+            sendScpi(profiles[selectedProfile].poll_cmd, true);
           }
           rx_line_pos = 0;
         }

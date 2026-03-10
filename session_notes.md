@@ -123,6 +123,15 @@ Core 1: USBHost.task() + serialized TX/RX scheduling
 - `USBHost.task(10)` — added 10ms timeout parameter
 - Both changes aimed at reducing pio_usb instability under sustained transfers
 
+## 2026-03-11 — Session 7
+- USB flash drive support integrated into main sketch
+- USBDrive + USBFilesystem added alongside USBSerial — auto-detected on connect
+- Storage mode: LOG:OFF/ON status bar, button toggles logging
+- Log files: log01.csv–log99.csv, EEPROM-backed counter, new file per on/off cycle
+- log_open / log_close / log_write helpers — ready for LA mode data source later
+- usbdrive_test sandbox sketch confirmed working (mount, write, read-back PASS)
+- Stability test: >232,000 readings with no freeze — Teensy native USB host confirmed stable
+
 ## 2026-03-10 — Session 6
 - Main sketch confirmed working end-to-end on Teensy 4.0 hardware
 - USB host, FT232R, RS232, SCPI, TFT scroll, encoder profile select all working
