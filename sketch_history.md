@@ -34,7 +34,12 @@ Most recent at top.
 
 ---
 
+## la_test.ino (2026-03-12, session 8 — current)
+- Status: **COMPILES CLEAN** — FLASH 94KB/2MB, RAM1 170KB/512KB
+- Features: 1–8 channel selection (encoder), ping-pong binary capture, TFT waveform, USB file logging
+- Timestamps: ARM DWT cycle counter (v2 file format)
+- USB file numbering: scans drive for highest la*.bin, auto-increments
+
 ## TODO
 - Before any future rewrite, snapshot the working state here first
-- Init git repo so we have actual history
 

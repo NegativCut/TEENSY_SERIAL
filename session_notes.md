@@ -106,8 +106,38 @@ Core 1: USBHost.task() + serialized TX/RX scheduling
 | `FIRMWARE/pico_usb_tft_enc/pico_usb_tft_enc.ino` | Working | Main sketch: TFT + encoder + USB host MSC |
 | `FIRMWARE/comport_test/comport_test.ino` | Working | Minimal CDC serial test |
 | `FIRMWARE/ft232_test/ft232_test.ino` | Working | FT232R USB host → RS232 SCPI comms (GDM-8251A) |
+| `FIRMWARE/la_test/la_test.ino` | Working | Logic analyser: 1–8ch capture, TFT waveform, binary file to USB |
 
 ---
+
+## 2026-03-12 — Session 8 (Logic Analyser)
+
+### la_test.ino — developed from scratch
+- 8-channel (configurable 1–8) interrupt edge capture, ping-pong buffer → USB flash drive `.bin`
+- ISR toggle pattern (`ch_state ^= 1`) — prevents impossible consecutive same-direction events; no digitalRead race
+- Ping-pong buffer: 2×4096 events; main loop flushes ready halves; separate 256-event circular disp_buf for TFT
+- Binary file format v1 → v2: added `uint32_t cpu_hz` to header; timestamps are `ARM_DWT_CYCCNT` (1.67ns @ 600MHz)
+- DWT cycle counter enabled in setup: `ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA`
+- Encoder rotation (disarmed) selects 1–8 channels; saved to EEPROM byte 1; ISRs attached for active channels only
+- Lane height on TFT scales dynamically: `(SCR_H - STATUS_H) / num_channels`
+- USB file numbering: `scan_log_files()` scans drive for highest `la*.bin`, starts from `highest + 1`; blank drive → `la01.bin`
+- EEPROM byte 0 = file counter fallback (no drive); byte 1 = num_channels
+
+### Logic_Analyser_Viewer — C# WinForms .NET 8
+- Repo: https://github.com/NegativCut/Logic_Analyser_Viewer
+- 8-channel waveform viewer, 1920×1080, GDI+ rendering, zoom/pan/scrollbar
+- Binary loader: handles v1 (µs timestamps) and v2 (cycle timestamps ÷ cpu_hz/1e6)
+- CSV loader: extracts raw events from step-function row transitions
+- Glitch filter: per-channel single-pass pair removal; `NumericUpDown` 0–10000 µs in status bar; live, preserves view
+- Status bar: filename, format, event count, span, event rate, active channels, view span, file size
+- Drag-and-drop file loading; auto-detect .bin/.csv by extension
+
+### Hardware / interfacing
+- Capture pins 14,15,16,17,20,21,22,23 — pins 18/19 skipped (I2C SDA/SCL with 2.2kΩ pull-ups)
+- TXS0108EPWR level shifter: works for passive sniffing (Teensy inputs = high-Z, auto-direction → B side drives A)
+  - Not recommended for I2C by TI but works passively; not ideal for active I2C participation
+  - VCCA=3.3V, VCCB=5V, OE=3.3V; 100nF decoupling on each VCC
+- Encoder pins: ENC_A=3, ENC_B=4, ENC_SW=2 (same across la_test and main sketch)
 
 ## 2026-03-07 — Session 1
 - Established project from empty directory
