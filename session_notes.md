@@ -110,6 +110,24 @@ Core 1: USBHost.task() + serialized TX/RX scheduling
 
 ---
 
+## 2026-03-14 — Session 10 (DMA capture sketch)
+
+### la_dma.ino — new sketch in FIRMWARE/la_dma/
+- Replaces per-edge ISRs with QTimer1-triggered DMA → GPIO6_DR → circular buffer
+- **DMA trigger:** QTimer1 ch0 (DMAMUX_SOURCE_QTIMER1_READ0=48) — PIT has no DMAMUX source on IMXRT1062
+- **DMA enable:** TMR_DMA_CMPLD1DE (compare-load 1 event triggers transfer)
+- **GPIO bit positions confirmed:** pins 14,15,16,17,20,21,22,23 = GPIO1/GPIO6 bits 18,19,23,22,26,27,24,25
+- **Clock:** QTimer driven by IPG (F_BUS/2 ≈ 66 MHz); TMR_COMP = 66M/SAMPLE_RATE - 1
+- **Default SAMPLE_RATE:** 5 MHz (200 ns resolution) → DMA_HALF fills every 409 µs
+- **DMA buffer:** 2×2048 uint32_t in OCRAM (DMAMEM), power-of-2 aligned for DMOD circular addressing
+- **Main loop:** processes ready DMA halves via `process_half()` — extract 8-ch state byte, detect changes, generate events
+- **Event format:** same v2 binary as la_test — compatible with Logic_Analyser_Viewer without changes
+- **TFT/USB/encoder:** same as la_test (armed=counter 1Hz, disarmed=waveform 10Hz)
+- **Timestamps:** DWT-based, interpolated from DMA half-end timestamp: `t = t_half_end - (DMA_HALF-1-i) * CYCLES_PER_SAMPLE`
+- **Known unknowns:** IPG clock assumed 66 MHz — verify with DEBUG serial output; adjust TMR_IPG_HZ if measured rate differs
+- **Arduino IDE broke** (arduino-cli setup from session 5 wiped boardsmanager.additional.urls); restored manually — see .claude/memory/reference_arduino_ide.md
+- **pymupdf installed** for PDF parsing (ST7735S.pdf datasheet); see .claude/memory/reference_pdf_parser.md
+
 ## 2026-03-13 — Session 9 (LA firmware performance review)
 
 ### Performance fixes applied to `la_test.ino`
