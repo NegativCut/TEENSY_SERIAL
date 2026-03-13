@@ -188,6 +188,17 @@ static void tft_drawMenu() {
   }
 }
 
+// ── Live reading display — overwrites one fixed line, no full redraw ──
+static void tft_show_reading(const char* val) {
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setCursor(0, SCROLL_Y);
+  char buf[LINE_W];
+  snprintf(buf, sizeof(buf), "%-21s", val);
+  tft.print(buf);
+  tft_draw_status();
+}
+
 // ── SCPI send ─────────────────────────────────────────────────────
 static void sendScpi(const char* cmd, bool log_it = true) {
   if (log_it) tft_logf("[>] %s", cmd);
@@ -344,12 +355,10 @@ void loop() {
           rx_count++;
           log_write(rx_line);
           if (!inMenu) {
-            char buf[LINE_W];
-            snprintf(buf, LINE_W, "[RX] %-16s", rx_line);
-            tft_log(buf);
+            tft_show_reading(rx_line);
           }
           if (profiles[selectedProfile].poll_cmd != nullptr) {
-            sendScpi(profiles[selectedProfile].poll_cmd, true);
+            sendScpi(profiles[selectedProfile].poll_cmd, false);
           }
           rx_line_pos = 0;
         }

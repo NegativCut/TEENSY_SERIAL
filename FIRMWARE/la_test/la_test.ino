@@ -73,12 +73,12 @@ struct __attribute__((packed)) Event {
 static volatile Event    disp_buf[DISP_SIZE];
 static volatile uint8_t  disp_write = 0;
 
-// ── Ping-pong buffer (for continuous file writing) ────────────────
-#define BUF_HALF   4096
+// ── Ping-pong buffer (OCRAM via DMAMEM — 384 KB, leaves DTCM free) ─
+#define BUF_HALF   32768
 
-static volatile Event    pp_buf[2][BUF_HALF];
+DMAMEM static volatile Event pp_buf[2][BUF_HALF];
 static volatile uint8_t  pp_active       = 0;
-static volatile uint16_t pp_pos          = 0;
+static volatile uint32_t pp_pos          = 0;  // uint32 — exceeds uint16 range
 static volatile bool     pp_ready[2]     = {false, false};
 static volatile uint32_t cap_total       = 0;
 static volatile uint32_t overflow_count  = 0;
@@ -120,7 +120,7 @@ static FASTRUN void isr_capture(uint8_t pin_idx) {
   disp_write = (dw + 1) % DISP_SIZE;
 
   uint8_t  h   = pp_active;
-  uint16_t pos = pp_pos;
+  uint32_t pos = pp_pos;
   pp_buf[h][pos].timestamp = t;
   pp_buf[h][pos].pin       = pin_idx;
   pp_buf[h][pos].rising    = val;
@@ -187,9 +187,8 @@ struct __attribute__((packed)) FileHeader {
 };  // = 24 bytes
 
 static bool log_open() {
-  // Find next available file number from drive contents
-  uint8_t highest = scan_log_files();
-  log_file_num = (highest >= 99) ? 1 : highest + 1;
+  // log_file_num already set by scan_log_files() on mount; just advance it
+  log_file_num = (log_file_num >= 99) ? 1 : log_file_num + 1;
   EEPROM.write(0, log_file_num);
 
   snprintf(last_log, sizeof(last_log), "la%02d.bin", log_file_num);
@@ -225,7 +224,7 @@ static void log_close_final() {
   log_flush_ready();
   noInterrupts();
   uint8_t  fh  = pp_active;
-  uint16_t fpo = pp_pos;
+  uint32_t fpo = pp_pos;
   interrupts();
   if (fpo > 0 && log_file) {
     log_file.write((const uint8_t*)pp_buf[fh],
@@ -499,13 +498,18 @@ void loop() {
   }
 
   // Throttled TFT refresh ~10 Hz while armed
+  // Flush any pending half BEFORE drawing (not instead of) so USB write
+  // completes before SPI blocks the loop. Flush again after draw to catch
+  // any half that filled during the TFT SPI transaction.
   static uint32_t disp_last = 0;
   if (armed && millis() - disp_last >= 100) {
     disp_last = millis();
     uint32_t t = cap_total;
     if (t != disp_shown) {
       disp_shown = t;
+      log_flush_ready();
       draw_waveform();
+      if (armed) log_flush_ready();
     }
   }
 }

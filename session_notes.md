@@ -110,6 +110,24 @@ Core 1: USBHost.task() + serialized TX/RX scheduling
 
 ---
 
+## 2026-03-13 — Session 9 (LA firmware performance review)
+
+### Performance fixes applied to `la_test.ino`
+- **TFT blocks USB flush (main bottleneck):** `draw_waveform()` takes 15–30ms (full fillRect + redraw over SPI). During that time `log_flush_ready()` cannot run → overflows at high event rates.
+  - Fix: call `log_flush_ready()` immediately BEFORE `draw_waveform()` (drain pending half first), then again after (catch any half filled during draw). TFT always updates — no skipping.
+  - Previous attempt (skip TFT frame if pp_ready set) caused TFT freeze at high event rates — reverted.
+- **Redundant `scan_log_files()` on arm:** `log_open()` was calling `scan_log_files()` (99× `myFS.exists()`) despite `log_file_num` already being set on drive mount. Removed — now just increments cached value.
+- **BUF_HALF increase reverted:** Doubling to 8192 doubled USB write size (24KB → 49KB). At the test signal frequency, 49KB write took longer than the other half took to fill → continuous overflow → only 29ms of data captured. Kept at 4096.
+- **Session notes reliability:** `CLAUDE.md` added to both project roots — session notes now written proactively without prompting.
+- **Binary analysis of la02.bin:** 3.31s capture, 5ch, 37,837 ev/s. Confirmed 483ms FAT32 cluster-boundary write stall at t=1.976s. The ~64ms gaps repeating every 100ms are natural signal idle periods (device under test, not firmware).
+- **preAllocate / seek-extend / truncate all abandoned** — `File` from USBHost_t36 doesn't support `preAllocate`; seek-extend caused 0-byte files; truncate caused 0-byte files. Reverted all.
+- **Root cause of stalls identified via binary analysis:** flash drive erase block boundary write latency spikes (~330–360ms). Not FAT cluster allocation.
+- **Fix: DMAMEM ping-pong buffer + larger BUF_HALF** — `pp_buf` moved to OCRAM with `DMAMEM` (384KB, leaves DTCM free). `BUF_HALF` increased 4096→32768 (fill time 228ms @ 143k ev/s). Covers all stalls ≤228ms. `pp_pos` widened to `uint32_t` throughout.
+- **la04.bin:** 39k ev/s, 330ms stalls visible as gaps. **la05.bin:** 143k ev/s, buffer covers 190–226ms stalls; 358ms stall still causes overflow at this rate.
+- **la06.bin:** 225k ev/s, old drive — 135 gaps >10ms, worst stall 554ms. Drive could not keep up; max sustainable rate ~59k ev/s on that drive.
+- **la01.bin (new fast drive):** 342k ev/s, zero drive stalls. All gaps are 64ms signal idle periods. Firmware confirmed gap-free at 342k ev/s. Old drive was root cause of all data gaps.
+- **Final config:** `BUF_HALF=32768` in OCRAM (`DMAMEM`), `pp_pos` widened to `uint32_t`. Fast USB drive required for high event rates.
+
 ## 2026-03-12 — Session 8 (Logic Analyser)
 
 ### la_test.ino — developed from scratch
