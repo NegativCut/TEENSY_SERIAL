@@ -295,6 +295,15 @@ static void draw_idle() {
   }
 }
 
+// ── Armed counter (minimal TFT update — 1 Hz while logging) ──────
+static void draw_armed_counter() {
+  tft.setTextSize(2);
+  tft.setTextColor(overflow_count > 0 ? TFT_RED : TFT_GREEN, TFT_BLACK);
+  tft.setCursor(0, STATUS_H + 20);
+  tft.printf("%-10lu", cap_total);
+  draw_status();
+}
+
 // ── Waveform draw (display buffer, num_channels lanes) ────────────
 static void draw_waveform() {
   noInterrupts();
@@ -480,7 +489,7 @@ void loop() {
 
       attach_isrs();
       tft.fillScreen(TFT_BLACK);
-      draw_waveform();
+      draw_armed_counter();
 
 #ifdef DEBUG
       if (Serial) Serial.printf("ARMED — %d channels\n", num_channels);
@@ -488,6 +497,8 @@ void loop() {
     } else {
       detach_isrs();
       if (drive_ready && log_file) log_close_final();
+      disp_shown = 0;  // force waveform redraw on next 10 Hz tick
+      tft.fillScreen(TFT_BLACK);
       draw_waveform();
 
 #ifdef DEBUG
@@ -497,19 +508,18 @@ void loop() {
     }
   }
 
-  // Throttled TFT refresh ~10 Hz while armed
-  // Flush any pending half BEFORE drawing (not instead of) so USB write
-  // completes before SPI blocks the loop. Flush again after draw to catch
-  // any half that filled during the TFT SPI transaction.
+  // TFT refresh:
+  //   Armed   — counter only, 1 Hz (keep SPI off the bus during capture)
+  //   Disarmed — full waveform, ~10 Hz
   static uint32_t disp_last = 0;
-  if (armed && millis() - disp_last >= 100) {
-    disp_last = millis();
-    uint32_t t = cap_total;
-    if (t != disp_shown) {
-      disp_shown = t;
-      log_flush_ready();
-      draw_waveform();
-      if (armed) log_flush_ready();
+  if (armed) {
+    if (millis() - disp_last >= 1000) {
+      disp_last = millis();
+      draw_armed_counter();
     }
+  } else if (cap_total != disp_shown && millis() - disp_last >= 100) {
+    disp_last  = millis();
+    disp_shown = cap_total;
+    draw_waveform();
   }
 }
