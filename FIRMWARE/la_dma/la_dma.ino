@@ -1,89 +1,82 @@
 /*
  * la_dma.ino
  *
- * Logic analyser — QTimer1-triggered DMA parallel GPIO capture
- * No per-edge ISRs. CPU-free during sampling. Detects state changes in
- * main loop and outputs event stream compatible with la_test v2 file format.
+ * Logic analyser — fixed-rate GPIO sampling + main-loop event detection
  *
- *  Capture pins: 14,15,16,17,20,21,22,23  (GPIO1/GPIO6 bits 18,19,23,22,26,27,24,25)
+ * Architecture (key difference from la_test):
+ *   la_test: per-edge CHANGE ISR → event detection + buffer write in ISR
+ *            → fails at high rates because ISR can't keep up with edge density
+ *
+ *   la_dma:  IntervalTimer ISR at SAMPLE_RATE → single GPIO read → circ_buf
+ *            → event detection in main loop (no ISR contention)
+ *            → ISR body is 3 instructions, works at 5 MHz+
+ *
+ *  Capture pins: 14,15,16,17,20,21,22,23  (all GPIO1/GPIO6)
  *  ENC_A: 3  |  ENC_B: 4  |  ENC_SW: 2  |  BLK: 7
  *
- * Architecture:
- *   QTimer1 ch0 fires at SAMPLE_RATE → triggers DMA → GPIO6_DR → dma_buf[] (circular)
- *   DMA ISR at half/complete: records timestamp, sets half_ready flag
- *   Main loop: processes ready DMA halves, extracts 8-ch state byte per sample,
- *              detects state changes, writes 6-byte events to ping-pong USB buffer
- *
- * File format: same as la_test v2 — compatible with Logic_Analyser_Viewer
+ * Output: v2 binary format, compatible with Logic_Analyser_Viewer
  *   Header 24 bytes: 'L','A', version=2, channels, pins[8], init_states[8], uint32_t cpu_hz
  *   Events  6 bytes: uint32_t timestamp (DWT cycles), uint8_t channel, uint8_t rising
  *
- * QTimer IPG clock: F_BUS/2 ≈ 66 MHz (AHB=132 MHz, IPG=66 MHz at 600 MHz CPU)
- *   Actual rate = 66 MHz / (TMR_COMP + 1)
- *   If rate is wrong, adjust TMR_IPG_HZ below.
+ * Timestamp source: DWT cycle counter captured in ISR alongside GPIO read.
+ *   timestamp / (cpu_hz / 1e6) = microseconds
  *
- * EEPROM byte 0: log file counter fallback
- * EEPROM byte 1: num_channels (1–8)
+ * EEPROM byte 0: log file counter  |  byte 1: num_channels
  */
 
 #include <TFT_eSPI.h>
 #include <Encoder.h>
 #include <USBHost_t36.h>
 #include <EEPROM.h>
-#include <DMAChannel.h>
 
-// #define DEBUG   // uncomment to enable Serial output
+// #define DEBUG
 
-#define TFT_BLK   7
-#define ENC_SW    2
-#define ENC_A     3
-#define ENC_B     4
+#define TFT_BLK  7
+#define ENC_SW   2
+#define ENC_A    3
+#define ENC_B    4
 
-static const uint8_t  LA_PIN[8]  = {14, 15, 16, 17, 20, 21, 22, 23};
-static const uint16_t CH_COL[8]  = {
+static const uint8_t  LA_PIN[8] = {14, 15, 16, 17, 20, 21, 22, 23};
+static const uint16_t CH_COL[8] = {
   TFT_GREEN, TFT_CYAN, TFT_YELLOW, TFT_MAGENTA,
   TFT_ORANGE, 0x567F, TFT_GREENYELLOW, TFT_PINK
 };
 
-// ── GPIO bit positions within GPIO1/GPIO6 for each capture pin ────
-// Pin 14=bit18, 15=bit19, 16=bit23, 17=bit22, 20=bit26, 21=bit27, 22=bit24, 23=bit25
-static const uint8_t GPIO_BIT[8] = {18, 19, 23, 22, 26, 27, 24, 25};
-
+// ── GPIO bit extraction ────────────────────────────────────────────
+// Pins 14,15,16,17,20,21,22,23 = GPIO1/GPIO6 bits 18,19,23,22,26,27,24,25
+// ch0..7 map to those bit positions respectively.
 static inline uint8_t extract_state(uint32_t g) {
-  uint8_t s  =  (g >> 18) & 0x03;          // ch0 (pin14, bit18), ch1 (pin15, bit19)
-  s |= (((g >> 23) & 0x01) << 2);          // ch2 (pin16, bit23)
-  s |= (((g >> 22) & 0x01) << 3);          // ch3 (pin17, bit22)
-  s |= (((g >> 26) & 0x01) << 4);          // ch4 (pin20, bit26)
-  s |= (((g >> 27) & 0x01) << 5);          // ch5 (pin21, bit27)
-  s |= (((g >> 24) & 0x01) << 6);          // ch6 (pin22, bit24)
-  s |= (((g >> 25) & 0x01) << 7);          // ch7 (pin23, bit25)
+  uint8_t s  =  (g >> 18) & 0x03;           // ch0 (bit18), ch1 (bit19)
+  s |= (((g >> 23) & 1) << 2);              // ch2 (bit23)
+  s |= (((g >> 22) & 1) << 3);              // ch3 (bit22)
+  s |= (((g >> 26) & 1) << 4);              // ch4 (bit26)
+  s |= (((g >> 27) & 1) << 5);              // ch5 (bit27)
+  s |= (((g >> 24) & 1) << 6);              // ch6 (bit24)
+  s |= (((g >> 25) & 1) << 7);              // ch7 (bit25)
   return s;
 }
 
 // ── Sample rate ────────────────────────────────────────────────────
-// IPG clock drives QTimer. At 600 MHz CPU: AHB=132 MHz, IPG=66 MHz.
-// Adjust TMR_IPG_HZ if measured rate differs (measure with DEBUG mode).
-#define TMR_IPG_HZ    66000000UL
-#define SAMPLE_RATE   5000000UL   // Hz — must divide evenly into TMR_IPG_HZ
-// Actual: 66 MHz / (TMR_COMP+1) — nearest achievable to SAMPLE_RATE
-#define TMR_COMP      ((uint16_t)(TMR_IPG_HZ / SAMPLE_RATE - 1))
-#define CYCLES_PER_SAMPLE  ((uint32_t)(F_CPU_ACTUAL / SAMPLE_RATE))
+// Reduce if IntervalTimer cannot achieve the period (try 0.5 for 2 MHz).
+#define SAMPLE_PERIOD_US  0.2f    // 0.2 µs = 5 MHz
 
-// ── DMA circular buffer (power-of-2 size + alignment for DMOD) ────
-// Buffer holds DMA_TOTAL uint32_t GPIO snapshots, split into two halves.
-// At 5 MHz, DMA_HALF=2048: each half fills in 2048/5M = 409 µs.
-#define DMA_HALF   2048
-#define DMA_TOTAL  (DMA_HALF * 2)
+// ── Sample circular buffer ────────────────────────────────────────
+// Holds raw GPIO reads + DWT timestamps. Power-of-2 for fast masking.
+// At 5 MHz, CIRC_HALF=2048 fills in 410 µs — plenty of time for main loop.
+#define CIRC_HALF   2048
+#define CIRC_TOTAL  (CIRC_HALF * 2)
+#define CIRC_MASK   (CIRC_TOTAL - 1)
 
-DMAMEM static __attribute__((aligned(DMA_TOTAL * sizeof(uint32_t))))
-  volatile uint32_t dma_buf[DMA_TOTAL];
+struct Sample {
+  uint32_t gpio;   // raw GPIO6_DR value
+  uint32_t cycle;  // DWT cycle counter at sample time
+};
 
-DMAChannel dma;
+DMAMEM static volatile Sample circ_buf[CIRC_TOTAL];
+static volatile uint32_t wr_ptr = 0;   // written by ISR
+static          uint32_t rd_ptr = 0;   // read by main loop
 
-static volatile bool     half_ready[2]  = {false, false};
-static volatile uint32_t half_ts[2]     = {0, 0};  // DWT at end of each half
-
-// ── Event struct (same as la_test) ───────────────────────────────
+// ── Event struct ──────────────────────────────────────────────────
 struct __attribute__((packed)) Event {
   uint32_t timestamp;
   uint8_t  pin;
@@ -95,21 +88,21 @@ struct __attribute__((packed)) Event {
 static volatile Event   disp_buf[DISP_SIZE];
 static volatile uint8_t disp_write = 0;
 
-// ── Ping-pong USB write buffer ────────────────────────────────────
-#define BUF_HALF   32768
+// ── USB ping-pong write buffer ────────────────────────────────────
+#define BUF_HALF  32768
 DMAMEM static volatile Event pp_buf[2][BUF_HALF];
-static volatile uint8_t  pp_active      = 0;
-static volatile uint32_t pp_pos         = 0;
-static volatile bool     pp_ready[2]    = {false, false};
-static volatile uint32_t cap_total      = 0;
+static volatile uint8_t  pp_active     = 0;
+static volatile uint32_t pp_pos        = 0;
+static volatile bool     pp_ready[2]   = {false, false};
+static volatile uint32_t cap_total     = 0;
 static volatile uint32_t overflow_count = 0;
 
 // ── App state ─────────────────────────────────────────────────────
 static uint8_t  num_channels = 8;
 static bool     armed        = false;
 static uint8_t  init_state[8];
-static uint8_t  ch_state_byte = 0;   // last known 8-ch state byte
-static uint32_t disp_shown   = 0;
+static uint8_t  prev_state_byte = 0;
+static uint32_t disp_shown  = 0;
 
 // ── Encoder ───────────────────────────────────────────────────────
 Encoder        myEnc(ENC_A, ENC_B);
@@ -127,6 +120,7 @@ static File     log_file;
 static uint32_t bytes_written = 0;
 
 TFT_eSPI tft;
+IntervalTimer sampleTimer;
 
 // ── Layout ────────────────────────────────────────────────────────
 #define SCR_W    160
@@ -135,128 +129,64 @@ TFT_eSPI tft;
 #define WAVE_X   18
 #define WAVE_W   (SCR_W - WAVE_X)
 
-// ── DMA ISR ───────────────────────────────────────────────────────
-// Fires at half and complete of each major DMA loop.
-// Alternates: half0 done, half1 done, half0 done, ...
-static volatile uint8_t dma_isr_half = 0;
-
-void dma_isr() {
-  dma.clearInterrupt();
-  uint8_t h = dma_isr_half;
-  half_ts[h]    = ARM_DWT_CYCCNT;
-  half_ready[h] = true;
-  dma_isr_half  = h ^ 1;
+// ── Sampling ISR — 3 instructions, runs at SAMPLE_RATE ───────────
+FASTRUN void sample_isr() {
+  uint32_t idx = wr_ptr & CIRC_MASK;
+  circ_buf[idx].cycle = ARM_DWT_CYCCNT;
+  circ_buf[idx].gpio  = GPIO6_DR;
+  wr_ptr++;
 }
 
-// ── QTimer1 setup (triggers DMA at SAMPLE_RATE) ───────────────────
-static void qtimer_dma_init() {
-  CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
-
-  TMR1_CTRL0  = 0;       // stop while configuring
-  TMR1_CNTR0  = 0;
-  TMR1_LOAD0  = 0;       // reload to 0 on compare
-  TMR1_COMP10 = TMR_COMP;
-  TMR1_CMPLD10 = TMR_COMP;
-
-  // CSCTRL: CL1=1 — reload COMP1 from CMPLD1 on each compare event (periodic)
-  TMR1_CSCTRL0 = TMR_CSCTRL_CL1(1);
-
-  // DMA: trigger on CMPLD1 load event
-  TMR1_DMA0 = TMR_DMA_CMPLD1DE;
-
-  // CTRL: count rising edges of IPG/1, count up to COMP1 then reload
-  TMR1_CTRL0 = TMR_CTRL_CM(1) | TMR_CTRL_PCS(8) | TMR_CTRL_LENGTH;
-
-  // Enable channel 0
-  TMR1_ENBL |= 1;
-}
-
-// ── DMA channel setup ─────────────────────────────────────────────
-static void dma_init() {
-  dma.begin(true);
-  dma.source(GPIO6_DR);
-  dma.destinationCircular(dma_buf, DMA_TOTAL * sizeof(uint32_t));
-  dma.transferSize(4);
-  dma.transferCount(DMA_TOTAL);
-  dma.triggerAtHardwareEvent(DMAMUX_SOURCE_QTIMER1_READ0);
-  dma.interruptAtHalf();
-  dma.interruptAtCompletion();
-  dma.attachInterrupt(dma_isr);
-  dma.enable();
-}
-
-// ── Start / stop DMA sampling ─────────────────────────────────────
-static void sampling_start() {
-  dma_isr_half  = 0;
-  half_ready[0] = false;
-  half_ready[1] = false;
-  // Enable QTimer to begin triggering DMA
-  TMR1_CTRL0 |= TMR_CTRL_CM(1);
-  dma.enable();
-}
-
-static void sampling_stop() {
-  TMR1_CTRL0 &= ~TMR_CTRL_CM(7);  // CM=0: stop counting
-  dma.disable();
-}
-
-// ── Write one event to both display and USB ping-pong buffers ─────
-static void write_event(uint32_t t, uint8_t ch, uint8_t rising) {
-  // Display buffer (circular, for TFT waveform)
-  uint8_t dw = disp_write;
-  disp_buf[dw] = {t, ch, rising};
-  disp_write   = (dw + 1) % DISP_SIZE;
-
-  // USB ping-pong buffer
-  uint8_t  h   = pp_active;
-  uint32_t pos = pp_pos;
-  pp_buf[h][pos] = {t, ch, rising};
-  pos++;
-  cap_total++;
-
-  if (pos >= BUF_HALF) {
-    uint8_t next = h ^ 1;
-    if (!pp_ready[next]) {
-      pp_ready[h] = true;
-      pp_active   = next;
-      pp_pos      = 0;
-    } else {
-      overflow_count++;
-      pp_pos = 0;
-    }
-  } else {
-    pp_pos = pos;
-  }
-}
-
-// ── Process one DMA half-buffer ───────────────────────────────────
-static void process_half(uint8_t h) {
-  uint32_t t_end = half_ts[h];
-  // t of sample i = t_end - (DMA_HALF - 1 - i) * CYCLES_PER_SAMPLE
-  uint32_t t_base = t_end - (uint32_t)(DMA_HALF - 1) * CYCLES_PER_SAMPLE;
-
-  volatile uint32_t *buf = dma_buf + h * DMA_HALF;
-  uint8_t nc = num_channels;
+// ── Process one CIRC_HALF worth of samples ────────────────────────
+static void process_samples() {
+  uint8_t nc   = num_channels;
   uint8_t mask = (nc == 8) ? 0xFF : (uint8_t)((1 << nc) - 1);
 
-  for (uint32_t i = 0; i < DMA_HALF; i++) {
-    uint8_t cur = extract_state(buf[i]) & mask;
-    uint8_t changed = cur ^ ch_state_byte;
-    if (changed) {
-      uint32_t t = t_base + i * CYCLES_PER_SAMPLE;
-      for (uint8_t ch = 0; ch < nc; ch++) {
-        if (changed & (1 << ch)) {
-          write_event(t, ch, (cur >> ch) & 1);
+  while ((wr_ptr - rd_ptr) >= CIRC_HALF) {
+    uint32_t end = rd_ptr + CIRC_HALF;
+    while (rd_ptr != end) {
+      uint32_t idx = rd_ptr & CIRC_MASK;
+      uint8_t  cur = extract_state(circ_buf[idx].gpio) & mask;
+      uint8_t  changed = cur ^ prev_state_byte;
+      if (changed) {
+        uint32_t t = circ_buf[idx].cycle;
+        for (uint8_t ch = 0; ch < nc; ch++) {
+          if (!(changed & (1 << ch))) continue;
+          uint8_t rising = (cur >> ch) & 1;
+
+          // Display buffer
+          uint8_t dw = disp_write;
+          disp_buf[dw] = {t, ch, rising};
+          disp_write   = (dw + 1) % DISP_SIZE;
+
+          // USB ping-pong
+          uint8_t  h   = pp_active;
+          uint32_t pos = pp_pos;
+          pp_buf[h][pos] = {t, ch, rising};
+          pos++;
+          cap_total++;
+          if (pos >= BUF_HALF) {
+            uint8_t next = h ^ 1;
+            if (!pp_ready[next]) {
+              pp_ready[h] = true;
+              pp_active   = next;
+              pp_pos      = 0;
+            } else {
+              overflow_count++;
+              pp_pos = 0;
+            }
+          } else {
+            pp_pos = pos;
+          }
         }
+        prev_state_byte = cur;
       }
-      ch_state_byte = cur;
+      rd_ptr++;
     }
   }
-
-  half_ready[h] = false;
 }
 
-// ── USB file helpers (same as la_test) ────────────────────────────
+// ── USB file helpers ──────────────────────────────────────────────
 static uint8_t scan_log_files() {
   char fname[14];
   uint8_t highest = 0;
@@ -376,17 +306,17 @@ static void draw_idle() {
 static void draw_waveform() {
   uint8_t  dw    = disp_write;
   uint32_t total = cap_total;
-  Event    snap[DISP_SIZE];
+  Event snap[DISP_SIZE];
   for (uint16_t i = 0; i < DISP_SIZE; i++) {
     snap[i].timestamp = disp_buf[i].timestamp;
     snap[i].pin       = disp_buf[i].pin;
     snap[i].rising    = disp_buf[i].rising;
   }
 
-  uint8_t nc     = num_channels;
-  uint8_t lane_h = (SCR_H - STATUS_H) / nc;
-  uint16_t count = (total < DISP_SIZE) ? (uint16_t)total : DISP_SIZE;
-  uint16_t head  = (total < DISP_SIZE) ? 0 : (uint16_t)dw;
+  uint8_t  nc     = num_channels;
+  uint8_t  lane_h = (SCR_H - STATUS_H) / nc;
+  uint16_t count  = (total < DISP_SIZE) ? (uint16_t)total : DISP_SIZE;
+  uint16_t head   = (total < DISP_SIZE) ? 0 : (uint16_t)dw;
 
   uint32_t t_start = 0, span = 0;
   if (count > 0) {
@@ -428,18 +358,16 @@ static void draw_waveform() {
         tft.drawFastHLine(prev_x, y_cur, ex - prev_x + 1, CH_COL[ch]);
       int16_t y_new = snap[idx].rising ? high_y : low_y;
       if (y_new != y_cur) {
-        int16_t y_top = (y_cur < y_new) ? y_cur : y_new;
+        int16_t y_top = min(y_cur, y_new);
         tft.drawFastVLine(ex, y_top, abs(y_new - y_cur) + 1, CH_COL[ch]);
       }
       state  = snap[idx].rising;
       prev_x = ex;
     }
-
     int16_t trail = WAVE_X + WAVE_W - prev_x;
     if (trail > 0)
       tft.drawFastHLine(prev_x, state ? high_y : low_y, trail, CH_COL[ch]);
   }
-
   draw_status();
 }
 
@@ -448,15 +376,13 @@ void setup() {
 #ifdef DEBUG
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
-  Serial.printf("la_dma: SAMPLE_RATE=%lu TMR_COMP=%u CYCLES_PER_SAMPLE=%lu\n",
-                SAMPLE_RATE, TMR_COMP, CYCLES_PER_SAMPLE);
+  Serial.printf("la_dma: SAMPLE_PERIOD_US=%.2f\n", SAMPLE_PERIOD_US);
 #endif
 
   ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
 
   pinMode(TFT_BLK, OUTPUT); digitalWrite(TFT_BLK, HIGH);
   pinMode(ENC_SW, INPUT_PULLUP);
-
   for (uint8_t i = 0; i < 8; i++) {
     pinMode(LA_PIN[i], INPUT);
     init_state[i] = 0;
@@ -472,11 +398,6 @@ void setup() {
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
   draw_idle();
-
-  qtimer_dma_init();
-  // DMA channel initialised but not triggered until armed
-  dma_init();
-  dma.disable();   // keep idle until armed
 
   myusb.begin();
 }
@@ -494,21 +415,17 @@ void loop() {
   if (!myFS && drive_ready) {
     drive_ready = false;
     if (armed) {
-      sampling_stop();
+      sampleTimer.end();
       armed    = false;
       log_file = File();
     }
     draw_idle();
   }
 
-  // Flush USB ping-pong while armed
-  if (armed) log_flush_ready();
-
-  // Process completed DMA halves (main capture work, no ISR overhead)
+  // Process sample buffer + flush USB while armed
   if (armed) {
-    for (uint8_t h = 0; h < 2; h++) {
-      if (half_ready[h]) process_half(h);
-    }
+    process_samples();
+    log_flush_ready();
   }
 
   // Encoder — channel select (disarmed only)
@@ -534,40 +451,41 @@ void loop() {
     armed = !armed;
 
     if (armed) {
-      // Snapshot initial pin states from live GPIO
-      uint32_t g = GPIO6_DR;
-      uint8_t  s = extract_state(g);
-      uint8_t  mask = (num_channels == 8) ? 0xFF : (uint8_t)((1 << num_channels) - 1);
-      ch_state_byte = s & mask;
+      // Snapshot initial states
+      uint8_t s = extract_state(GPIO6_DR);
+      uint8_t mask = (num_channels == 8) ? 0xFF : (uint8_t)((1 << num_channels) - 1);
+      prev_state_byte = s & mask;
       for (uint8_t i = 0; i < num_channels; i++)
         init_state[i] = (s >> i) & 1;
 
-      // Reset capture state
-      pp_active       = 0;
-      pp_pos          = 0;
-      pp_ready[0]     = false;
-      pp_ready[1]     = false;
-      cap_total       = 0;
-      overflow_count  = 0;
-      disp_write      = 0;
-      disp_shown      = 0;
-      bytes_written   = 0;
-      last_log[0]     = '\0';
+      // Reset all counters
+      pp_active      = 0; pp_pos = 0;
+      pp_ready[0]    = false; pp_ready[1] = false;
+      cap_total      = 0; overflow_count = 0;
+      disp_write     = 0; disp_shown = 0;
+      bytes_written  = 0; last_log[0] = '\0';
+      wr_ptr = 0; rd_ptr = 0;
 
       if (drive_ready) log_open();
 
-      sampling_start();
+      // Start sampling ISR
+      if (!sampleTimer.begin(sample_isr, SAMPLE_PERIOD_US)) {
+        // Period too short — fall back to 1 MHz
+        sampleTimer.begin(sample_isr, 1.0f);
+#ifdef DEBUG
+        Serial.println("IntervalTimer: fell back to 1 MHz");
+#endif
+      }
+
       tft.fillScreen(TFT_BLACK);
       draw_armed_counter();
 
 #ifdef DEBUG
-      Serial.printf("ARMED — %d channels, init_state=0x%02X\n", num_channels, ch_state_byte);
+      Serial.printf("ARMED — %d ch, init=0x%02X\n", num_channels, prev_state_byte);
 #endif
     } else {
-      sampling_stop();
-      // Process any remaining DMA data
-      for (uint8_t h = 0; h < 2; h++)
-        if (half_ready[h]) process_half(h);
+      sampleTimer.end();
+      process_samples();   // drain remaining samples
       if (drive_ready && log_file) log_close_final();
       disp_shown = 0;
       tft.fillScreen(TFT_BLACK);
@@ -579,7 +497,7 @@ void loop() {
     }
   }
 
-  // TFT: counter at 1 Hz while armed, waveform at 10 Hz while disarmed
+  // TFT: counter 1 Hz while armed, waveform 10 Hz while disarmed
   static uint32_t disp_last = 0;
   if (armed) {
     if (millis() - disp_last >= 1000) {
