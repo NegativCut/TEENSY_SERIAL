@@ -128,6 +128,19 @@ Core 1: USBHost.task() + serialized TX/RX scheduling
 - **Arduino IDE broke** (arduino-cli setup from session 5 wiped boardsmanager.additional.urls); restored manually — see .claude/memory/reference_arduino_ide.md
 - **pymupdf installed** for PDF parsing (ST7735S.pdf datasheet); see .claude/memory/reference_pdf_parser.md
 
+### DMA capture — reverted (both attempts failed)
+- **Attempt 1 — wrong DMAMUX source:** `DMAMUX_SOURCE_QTIMER1_READ0` (48) is input-capture mode; compare trigger needs `DMAMUX_SOURCE_QTIMER1_WRITE0_CMPLD1` (52). Fixed source but DMA still silent — no TFT counter increment, no USB data.
+- **Attempt 2 — IntervalTimer ISR polling:** Every 200ns ISR reads GPIO6_DR, diffs against previous — worse than la_test. USB stack starved at 5MHz ISR rate.
+- **Root cause (not identified until after both attempts):** Single-core IMXRT1062 with USBHost_t36 cannot run high-frequency GPIO polling AND USB bulk writes simultaneously. No XBAR routing exists to make QTimer compare directly DMA-read GPIO without ISR involvement. DMAMUX READ sources are for capturing timer input, not triggering GPIO reads.
+- **Decision:** `la_dma/` deleted, reverted to `la_test`.
+
+### la_test.ino — cleanup and logic fixes
+- **Removed all waveform display infrastructure:** `disp_buf[256]`, `disp_write`, `disp_shown`, `DISP_SIZE`, `WAVE_X`, `WAVE_W`, `draw_waveform()` — all gone. No ISR writes to disp_buf.
+- **TFT behaviour now:** disarmed = settings screen only (channel count, pin list, next file); armed = event counter at 1 Hz only.
+- **Renamed:** `draw_idle()` → `draw_settings()`; status text "FRZ"→"DONE", "DISARMD"→"READY"
+- **Drive unmount while armed bug fixed:** previously called `log_file = File()` without closing first — silently abandoned unflushed data. Now calls `log_file.close()` before nulling.
+- **la_dma/ deleted** from working directory (was never committed).
+
 ## 2026-03-13 — Session 9 (LA firmware performance review)
 
 ### Performance fixes applied to `la_test.ino`

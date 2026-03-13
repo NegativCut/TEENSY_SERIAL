@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python --version 2>&1 && pip --version 2>&1)",
+      "Bash(pip install:*)",
+      "Bash(python -c \"\nimport fitz\ndoc = fitz.open\\('G:/09 dropbox/code/git_repos/teensy_usb_tft_enc_serial/DATASHEET/ST7735S.pdf'\\)\nprint\\(f'{doc.page_count} pages'\\)\nprint\\(doc[0].get_text\\(\\)[:500]\\)\n\")",
+      "Bash(ls \"C:/Users/Dell/AppData/Local/Arduino15/package_\"*\"_index.json\" 2>/dev/null)",
+      "Bash(find \"C:/Users/Dell/AppData/Local/Arduino15/\" -name \"*.h\" 2>/dev/null | grep -i teensy | head -20)",
+      "Read(//c/Program Files \\(x86\\)/Arduino/hardware/**)",
+      "Read(//g/09 DROPBOX/CODE/**)",
+      "Bash(find \"C:/Program Files \\(x86\\)/Arduino/hardware/teensy/\" -name \"DMAChannel.h\" 2>/dev/null && find \"C:/Program Files \\(x86\\)/Arduino/hardware/teensy/\" -name \"imxrt.h\" 2>/dev/null)",
+      "Bash(grep -n \"digitalPinToBitMask\\\\|pin_num.*14\\\\b\\\\|{14,\\\\|14.*GPIO\" \"C:/Program Files \\(x86\\)/Arduino/hardware/teensy/avr/cores/teensy4/pins_teensy.c\" 2>/dev/null | head -20)",
+      "Bash(find \"C:/Program Files \\(x86\\)/Arduino/hardware/teensy/\" -name \"teensy40.csv\" -o -name \"pins*.h\" 2>/dev/null | head -10)",
+      "Bash(cd \"G:/09 dropbox/code/git_repos/teensy_usb_tft_enc_serial\" && rm -rf FIRMWARE/la_dma/)"
+    ]
+  }
+}
